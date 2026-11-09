@@ -1,0 +1,239 @@
+name: oceanclean
+
+# Every container runs in UTC so timestamps never depend on host defaults.
+x-utc: &utc
+  TZ: UTC
+
+# .env.example holds every setting's only default; an optional .env overrides it.
+x-env: &env
+  env_file:
+    - path: ../.env.example
+    - path: ../.env
+      required: false
+  environment: *utc
+  restart: unless-stopped
+
+x-py: &py
+  <<: *env
+  image: oceanclean-py
+  build: { context: .., dockerfile: infra/docker/python.Dockerfile }
+
+services:
+  kafka:
+    image: apache/kafka:3.7.2
+    # No env_file: the image turns every KAFKA_* variable into a broker property.
+    environment:
+      <<: *utc
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # Ingestion creates the topic with TELEMETRY_PARTITIONS; never auto-create it with 1.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_LOG_RETENTION_HOURS: 72
+      KAFKA_HEAP_OPTS: -Xmx512m -Xms512m
+    ports: ["29092:29092"]
+    volumes: [kafka-data:/var/lib/kafka/data]
+    healthcheck:
+      test: /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null
+      interval: 5s
+      timeout: 10s
+      retries: 20
+    mem_limit: 1g
+    restart: unless-stopped
+
+  postgis:
+    <<: *env
+    image: postgis/postgis:16-3.4-alpine
+    ports: ["5433:5432"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/10-init.sql:ro
+    healthcheck:
+      test: pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}
+      interval: 3s
+      retries: 30
+    mem_limit: 512m
+
+  minio:
+    <<: *env
+    image: cgr.dev/chainguard/minio:latest
+    command: ["server", "/data", "--console-address", ":9001"]
+    ports: ["9000:9000", "9001:9001"]
+    volumes: [minio-data:/data]
+    mem_limit: 512m
+
+  minio-init:
+    <<: *py
+    command: python infra/minio/init_bucket.py
+    depends_on: [minio]
+    restart: "no"
+
+  ingestion:
+    <<: *py
+    command: uvicorn ingestion_app:app --host 0.0.0.0 --port 8000
+    ports: ["8001:8000"]
+    depends_on: { kafka: { condition: service_healthy } }
+    healthcheck:
+      test: python -c "import urllib.request;urllib.request.urlopen('http://localhost:8000/health')"
+      interval: 3s
+      retries: 30
+    mem_limit: 256m
+
+  simulator:
+    <<: *py
+    command: python simulator/sim_main.py
+    volumes: [sim-state:/state]
+    depends_on:
+      ingestion: { condition: service_healthy }
+      postgis: { condition: service_healthy }
+      minio-init: { condition: service_completed_successfully }
+    mem_limit: 256m
+
+  # M6: the previous mission's 30 days at 1 Hz (~2.6M events) burst through ingestion, then exit.
+  # Needs the live run an hour past SIM_START; it never touches the live sim state.
+  backfill:
+    <<: *py
+    profiles: [batch]
+    command: python simulator/sim_main.py --fast-forward 30d --tick 1
+    depends_on:
+      ingestion: { condition: service_healthy }
+      postgis: { condition: service_healthy }
+      minio-init: { condition: service_completed_successfully }
+    mem_limit: 256m
+    restart: "no"
+
+  api:
+    <<: *py
+    command: uvicorn api_app:app --host 0.0.0.0 --port 8000
+    ports: ["8002:8000"]
+    depends_on:
+      postgis: { condition: service_healthy }
+      minio-init: { condition: service_completed_successfully }
+    healthcheck:
+      test: python -c "import urllib.request;urllib.request.urlopen('http://localhost:8000/health')"
+      interval: 3s
+      retries: 30
+    mem_limit: 256m
+
+  # Static build of web/ behind nginx, which proxies /api and /ws to the api service.
+  web:
+    build: { context: ../web }
+    ports: ["8080:80"]
+    environment: *utc
+    depends_on: { api: { condition: service_healthy } }
+    mem_limit: 64m
+    restart: unless-stopped
+
+  spark-stream:
+    <<: *env
+    image: oceanclean-spark
+    build: { context: .., dockerfile: infra/docker/spark.Dockerfile }
+    command: >
+      /opt/bitnami/spark/bin/spark-submit --master local[2] --driver-memory 1g
+      --conf spark.ui.port=4040 --conf spark.driver.extraJavaOptions=-Duser.timezone=UTC
+      /app/streaming/telemetry_stream.py
+    volumes:
+      - ../common:/app/common:ro
+      - ../streaming:/app/streaming:ro
+      - ../routing:/app/routing:ro
+      - ../batch:/app/batch:ro
+      - spark-checkpoints:/checkpoints
+    ports: ["4040:4040"]
+    depends_on:
+      kafka: { condition: service_healthy }
+      postgis: { condition: service_healthy }
+      ingestion: { condition: service_healthy }
+      minio-init: { condition: service_completed_successfully }
+    mem_limit: 2560m  # three queries; two alone used ~1.6 GB
+
+  # Batch layer, run on demand (`--profile batch`, see CLAUDE.md Commands).
+  fetch:
+    <<: *py
+    profiles: [batch]
+    command: sh -c "python batch/fetch_currents.py && python batch/fetch_microplastics.py"
+    # Host directory, so the offline cache survives `down -v`. Create it first (mkdir -p).
+    volumes: [../data/cache:/app/data/cache]
+    depends_on:
+      minio-init: { condition: service_completed_successfully }
+      postgis: { condition: service_healthy }
+    restart: "no"
+
+  spark-batch:
+    <<: *env
+    profiles: [batch]
+    image: oceanclean-spark
+    build: { context: .., dockerfile: infra/docker/spark.Dockerfile }
+    command: >
+      /opt/bitnami/spark/bin/spark-submit --master local[2] --driver-memory 2g
+      --conf spark.ui.port=4041 --conf spark.driver.extraJavaOptions=-Duser.timezone=UTC
+      /app/batch/currents_etl.py
+    volumes:
+      - ../common:/app/common:ro
+      - ../batch:/app/batch:ro
+    ports: ["4041:4041"]
+    depends_on:
+      minio-init: { condition: service_completed_successfully }
+    mem_limit: 3g
+    restart: "no"
+
+  # Telemetry history (M5): bronze ticks -> silver -> gold daily views + the analytics export.
+  telemetry-etl:
+    <<: *env
+    profiles: [batch]
+    image: oceanclean-spark
+    build: { context: .., dockerfile: infra/docker/spark.Dockerfile }
+    command: >
+      /opt/bitnami/spark/bin/spark-submit --master local[2] --driver-memory 1g
+      --conf spark.ui.port=4042 --conf spark.driver.extraJavaOptions=-Duser.timezone=UTC
+      /app/batch/telemetry_etl.py
+    volumes:
+      - ../common:/app/common:ro
+      - ../batch:/app/batch:ro
+      - ../routing:/app/routing:ro
+    depends_on:
+      minio-init: { condition: service_completed_successfully }
+      postgis: { condition: service_healthy }
+    mem_limit: 1536m
+    restart: "no"
+
+  # The same job on a timer, so the Analytics tab stays current without manual runs. A fresh
+  # JVM per run keeps memory free between runs; reset_sim.sh stops it during a reset.
+  analytics:
+    <<: *env
+    image: oceanclean-spark
+    build: { context: .., dockerfile: infra/docker/spark.Dockerfile }
+    command:
+      - sh
+      - -c
+      - >-
+        while true; do
+        /opt/bitnami/spark/bin/spark-submit --master local[2] --driver-memory 1g
+        --conf spark.ui.enabled=false --conf spark.driver.extraJavaOptions=-Duser.timezone=UTC
+        /app/batch/telemetry_etl.py || echo "telemetry-etl run failed; retrying next cycle";
+        sleep "$$ANALYTICS_REFRESH_S";
+        done
+    volumes:
+      - ../common:/app/common:ro
+      - ../batch:/app/batch:ro
+      - ../routing:/app/routing:ro
+    depends_on:
+      minio-init: { condition: service_completed_successfully }
+      postgis: { condition: service_healthy }
+    mem_limit: 1536m
+    restart: unless-stopped
+
+volumes:
+  kafka-data:
+  pgdata:
+  minio-data:
+  spark-checkpoints:
+  sim-state:
