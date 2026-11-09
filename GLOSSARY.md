@@ -1,0 +1,24 @@
+# Glossary
+
+- **Cleaner / vessel**: the single cleanup ship (`OC-01`).
+- **Patch**: a synthetic debris cluster (position, mass kg, radius) seeded from hotspots and advected by currents.
+- **Survey**: the hourly snapshot of every patch (position, mass; 0 = collected) published on `debris_survey`; the optimizer plans from the latest one.
+- **Windage**: wind-driven drift of a patch that the optimizer does not model; why real patches leave their predicted tracks (ADR-0007).
+- **Ghost**: a patch's predicted position at the planned intercept time.
+- **Hotspot**: a 1° cell with persistent negative divergence of surface currents (convergence), where floating debris accumulates: in the most convergent quarter of cells and converging on more than half of the days (ADR-0006).
+- **Validation ratio**: median measured microplastics concentration (pieces/m³) in hotspot cells divided by the median in all other analysed cells.
+- **History / mission window**: the ~2 years of daily SCUD currents over the history box, and the last 45 days of it over the mission box (exported for routing and the simulator).
+- **Intercept**: the earliest point where the vessel can meet a drifting patch.
+- **Recalc gate**: the rule that triggers route recomputation only on > 2 km predicted deviation, a collected target, or no active route.
+- **Route proposal**: a `routes` row the gate created, `pending` until the operator accepts (`active`), rejects or it expires (ADR-0007).
+- **Loiter**: the low-power circling mode (on battery above its reserve) used when the vessel has no route to follow, e.g. when a proposal expires and there is no active route.
+- **Autopilot**: the default HITL mode; the API accepts every proposal at once (a fresh plan after each collection included) and never holds the clock. Off = the operator decides in the modal within 30 s while the sim clock is held (ADR-0008).
+- **HITL hold**: `sim_clock.hitl_hold`, the API's clock hold while a proposal awaits the operator; separate from the operator's pause.
+- **Window**: a 5-minute event-time (sim time) tumbling window of one vessel's telemetry from the watermarked query; carries measured vs expected energy and the fuel-burn anomaly score (`telemetry_windows`).
+- **Residual**: (measured − expected energy) / expected for one window; its z-score against recent normal windows flags a fuel-burn anomaly.
+- **Sim clock**: compressed simulation time; all `event_ts` values are sim time. The operator sets its rate and pause through the API (`sim_clock` table).
+- **Wake**: the vessel's recent track on the live map (last 48 sim-hours).
+- **Backfill**: the vessel's previous mission, the 30 sim-days before SIM_START logged at 1 Hz (2.59M events), burst through ingestion and Kafka in a few minutes by `--fast-forward 30d`; seqs 1..n, below the live run's (ADR-0009).
+- **Drift replay / time slider**: debris parcels from the mission-box hotspot cells advected through the mission window's real daily currents, shown frame by frame (6 sim-hours) over the current particles of that day (`/replay`).
+- **Bronze / silver / gold**: raw / cleaned / aggregated lake layers.
+- **Zone**: 5° lat/lon cell id derived at ingestion, part of the Kafka key.
